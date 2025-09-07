@@ -1,9 +1,11 @@
 (ns org.soulspace.qclojure.adapter.backend.ibmq
   (:require [clojure.spec.alpha :as s]
             [clojure.data.json :as json]
+            [babashka.http-client :as http]
             [martian.core :as martian]
             [martian.babashka.http-client :as martian-http]
-            [org.soulspace.qclojure.application.backend :as qb] 
+            [org.soulspace.qclojure.application.backend :as qb]
+            [org.soulspace.qclojure.application.hardware-optimization :as hwopt]
             [org.soulspace.qclojure.application.format.qasm3 :as qasm3]))
 
 
