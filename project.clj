@@ -6,7 +6,9 @@
                  [org.clojure/data.json "2.4.0"]
                  [org.clojure/spec.alpha "0.3.218"]
                  [org.babashka/http-client "0.4.23"]
-                 [org.soulspace/qclojure "0.12.0"]]
+                 [com.github.oliyh/martian "0.2.0"]
+                 [com.github.oliyh/martian-babashka-http-client "0.2.0"]
+                 [org.soulspace/qclojure "0.15.0"]]
 
   :scm {:name "git" :url "https://github.com/lsolbach/qclojure-ibmq"}
   :deploy-repositories [["clojars" {:sign-releases false :url "https://clojars.org/repo"}]])
