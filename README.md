@@ -7,6 +7,11 @@ of IBM Quantum.
 Disclaimers:
 * *experimental/pre-alpha*
 
+[![Clojars Project](https://img.shields.io/clojars/v/org.soulspace/qclojure-ibmq.svg)](https://clojars.org/org.soulspace/qclojure-ibmq)
+[![cljdoc badge](https://cljdoc.org/badge/org.soulspace/qclojure-ibmq)](https://cljdoc.org/d/org.soulspace/qclojure-ibmq)
+![GitHub](https://img.shields.io/github/license/lsolbach/qclojure-ibmq)
+
+
 ## Copyright
 © 2025 Ludger Solbach
 
