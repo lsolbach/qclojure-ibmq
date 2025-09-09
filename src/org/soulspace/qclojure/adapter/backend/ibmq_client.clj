@@ -1,17 +1,12 @@
-(ns org.soulspace.qclojure.adapter.backend.ibmq
+(ns org.soulspace.qclojure.adapter.backend.ibmq-client
   (:require [clojure.spec.alpha :as s]
             [clojure.data.json :as json]
             [babashka.http-client :as http]
             [martian.core :as martian]
-            [martian.babashka.http-client :as martian-http]
-            [org.soulspace.qclojure.application.backend :as qb]
-            [org.soulspace.qclojure.application.hardware-optimization :as hwopt]
-            [org.soulspace.qclojure.application.format.qasm3 :as qasm3]))
-
+            [martian.babashka.http-client :as martian-http]))
 
 ; https://quantum.cloud.ibm.com/api/openapi.json
 (def ibmq (martian-http/bootstrap-openapi "https://quantum.cloud.ibm.com/api/openapi.json"))
-
 
 (comment
   ;; Example how to use the ibmq martian client
