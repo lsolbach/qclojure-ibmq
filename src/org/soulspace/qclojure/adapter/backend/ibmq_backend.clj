@@ -17,7 +17,8 @@
             [clojure.string :as str]
             [martian.core :as martian]
             [org.soulspace.qclojure.adapter.backend.ibmq-client :refer [ibmq]]
-            [org.soulspace.qclojure.application.backend :as qb]
+            [org.soulspace.qclojure.application.hardware-optimization :as hwopt]
+            [org.soulspace.qclojure.application.backend :as backend]
             [org.soulspace.qclojure.application.format.qasm3 :as qasm3]))
 
 ;;;
@@ -65,11 +66,11 @@
   
   Parameters:
   - circuit: Quantum circuit map with :operations and :num-qubits
+  - device: Device map
   - shots: Number of measurement shots
-  - backend-id: Backend device identifier for device-specific timing
   
   Returns: Estimated execution time in microseconds"
-  [circuit shots backend-id]
+  [circuit backend-id shots]
   (let [operations (:operations circuit)
         num-qubits (:num-qubits circuit)
         
@@ -211,7 +212,7 @@
   This protocol provides access to IBM-specific features like job metrics, session management,
   usage analytics, and transpiled circuit access."
   
-  (get-job-metrics [this job-id]
+  (job-metrics [this job-id]
     "Get detailed execution metrics for a job.
     
     Parameters:
@@ -224,7 +225,7 @@
     - :cost-breakdown - Detailed cost information
     - :raw-metrics - Raw IBM metrics response")
   
-  (get-job-logs [this job-id]
+  (job-logs [this job-id]
     "Get execution logs for a job for debugging purposes.
     
     Parameters:
@@ -235,7 +236,7 @@
     - :log-level - Logging level used
     - :raw-logs - Raw IBM logs response")
   
-  (get-transpiled-circuit [this job-id]
+  (transpiled-circuit [this job-id]
     "Get the transpiled/optimized circuit that was actually executed.
     
     Parameters:
@@ -275,6 +276,7 @@
     - :closed? - Boolean indicating if successfully closed
     - :final-cost - Final session cost if available")
   
+  ; TODO consolidate with session-info
   (get-session-info [this session-id]
     "Get information about an active session.
     
@@ -283,7 +285,7 @@
     
     Returns: Map with session details including status and cost")
   
-  (get-usage-analytics [this options]
+  (usage-analytics [this options]
     "Get usage analytics and billing information.
     
     Parameters:
@@ -299,16 +301,28 @@
     - :cost-by-backend - Cost breakdown by backend
     - :usage-trends - Usage trends over time"))
 
+; TODO use function from backend with qcloure 0.17.0 
+(defn device-entry
+  "Create a map of device ID to device map entry."
+  [device]
+  [(:id device) device])
+
 ;;;
 ;;; IBM Quantum Backend implementation
 ;;;
+(defonce backend-state
+  (atom {:job-counter 0
+         :active-jobs {}
+         :devices []
+         :current-device nil}))
+
 (defn- normalize-job-id [resp]
   (or (some-> resp :body :id) (some-> resp :body :job_id) (some-> resp :body)))
 
 
 (defrecord IBMQBackend [state jobs]
-  qb/QuantumBackend
-  (get-backend-info [_this]
+  backend/QuantumBackend
+  (backend-info [_this]
     (let [api-token (:api-token @state)
           props-resp (call-martian ibmq api-token :get-backend-properties {})
           gates (or (get-in props-resp [:body :gates]) [])]
@@ -320,13 +334,9 @@
        :capabilities #{:cloud-execution :openqasm3}
        :raw-properties (:body props-resp)}))
 
-  (get-supported-gates [_this]
-    (let [api-token (:api-token @state)
-          resp (call-martian ibmq api-token :get-backend-properties {})
-          gates (get-in resp [:body :gates])]
-      (->> gates (map #(keyword (name %))) set)))
+  (device [_this] (:current-device @backend-state))
 
-  (is-available? [_this]
+  (available? [_this]
     (let [api-token (:api-token @state)
           resp (call-martian ibmq api-token :list-backends {})
           body (or (safe-parse-body (:body resp)) (:body resp))
@@ -365,7 +375,7 @@
       ;; Return only job-id per QClojure contract
       local-id))
 
-  (get-job-status [_this job-id]
+  (job-status [_this job-id]
     (let [api-token (:api-token @state)]
       (if-let [entry (@jobs job-id)]
         (let [provider-id (:provider-id entry)
@@ -382,7 +392,7 @@
           status)
         :unknown)))
 
-  (get-job-result [_this job-id]
+  (job-result [_this job-id]
     (let [api-token (:api-token @state)]
       (if-let [entry (@jobs job-id)]
         (let [provider-id (:provider-id entry)
@@ -417,13 +427,58 @@
         {:job-id job-id :provider-id provider-id :cancelled? (boolean resp) :raw resp})
       {:error "unknown-job" :job-id job-id}))
 
-  (get-queue-status [_this]
+  (queue-status [_this]
     ;; Synthesize a simple queue view from tracked jobs
     (let [counts (vals @jobs)
           total (count counts)]
       {:total-tracked total}))
 
-  qb/CloudQuantumBackend
+  backend/MultiDeviceBackend
+  (devices [_this]
+    (let [api-token (:api-token @state)
+          resp (call-martian ibmq api-token :list-backends {})
+          raw (or (get-in resp [:body :backends]) (get-in resp [:body :devices]) [])]
+      (mapv (fn [d]
+              (let [id (or (:id d) (:device_id d) (:backend d) (:backend_name d))
+                    name (or (:name d) (:backend_name d) id)
+                    status-str (str/lower-case (or (:status d) "online"))
+                    status (keyword status-str)
+                    n-qubits (or (:num_qubits d) (:n_qubits d) (:qubits d) (:max-qubits d))]
+                {:device-id (str id)
+                 :device-name name
+                 :device-status (if (#{"online" "available"} (name status)) :online :offline)
+                 :max-qubits n-qubits
+                 :raw d}))
+            raw)))
+
+  (select-device [_this device]
+    (let [device (if (string? device)
+                   (some (fn [d] (when (= (:id d) device) d))
+                         (:devices @backend-state))
+                   device)]
+      (swap! backend-state assoc :current-device device)
+      (:current-device @backend-state)))
+
+  backend/BatchJobBackend
+  (batch-submit [_this circuits options]
+    (let [circs (if (sequential? circuits) circuits [circuits])
+          ids (mapv (fn [c] (backend/submit-circuit _this c options)) circs)
+          batch-id (str (java.util.UUID/randomUUID))]
+      (swap! jobs assoc batch-id {:job-ids ids :submitted-at (java.time.Instant/now)})
+      {:batch-id batch-id :job-ids ids}))
+
+  (batch-status [_this batch-id]
+    (if-let [b (@jobs batch-id)]
+      {:batch-id batch-id :job-ids (:job-ids b)}
+      {:error "unknown-batch" :batch-id batch-id}))
+
+  (batch-results [_this batch-id]
+    (if-let [b (@jobs batch-id)]
+      {:batch-id batch-id :results (mapv (fn [job-id] (backend/job-result _this job-id)) (:job-ids b))}
+      {:error "unknown-batch" :batch-id batch-id}))
+
+
+  backend/CloudQuantumBackend
   (authenticate [_this credentials]
     (let [token (or (:api-token credentials)
                     (:token credentials)
@@ -435,94 +490,47 @@
       (swap! state assoc :api-token token :authenticated-at (System/currentTimeMillis))
       {:status :authenticated :token-set true}))
 
-  (get-session-info [_this]
+  (session-info [_this]
     (let [token (:api-token @state)]
       (if token
         {:status :authenticated :has-token true :authenticated-at (:authenticated-at @state)}
         {:status :unauthenticated :has-token false})))
 
-  (list-available-devices [_this]
-    (let [api-token (:api-token @state)
-          resp (call-martian ibmq api-token :list-backends {})
-          raw (or (get-in resp [:body :backends]) (get-in resp [:body :devices]) [])]
-  (mapv (fn [d]
-      (let [id (or (:id d) (:device_id d) (:backend d) (:backend_name d))
-        name (or (:name d) (:backend_name d) id)
-        status-str (str/lower-case (or (:status d) "online"))
-        status (keyword status-str)
-        n-qubits (or (:num_qubits d) (:n_qubits d) (:qubits d) (:max-qubits d))]
-                {:device-id (str id)
-                 :device-name name
-                 :device-status (if (#{"online" "available"} (name status)) :online :offline)
-                 :max-qubits n-qubits
-                 :raw d}))
-            raw)))
-
-  (get-device-topology [_this device-id]
-    (let [api-token (:api-token @state)
-          resp (call-martian ibmq api-token :get-backend-configuration {:id device-id})]
-      {:device-id device-id
-       :coupling-map (or (get-in resp [:body :coupling_map]) (get-in resp [:body :topology]) [])
-       :raw (:body resp)}))
-
-  (get-calibration-data [_this device-id]
-    (let [api-token (:api-token @state)
-          resp (call-martian ibmq api-token :get-backend-properties {:id device-id})]
-      {:device-id device-id
-       :calibration (or (get-in resp [:body :calibration]) (:body resp))}))
-
   (estimate-cost [_this circuit options]
     (let [shots (get options :shots 1024)
           backend (get options :backend "ibm_qasm_simulator")
-          
+
           ;; Get device pricing information  
           device-pricing (get-device-pricing-tier backend)
-          
+
           ;; Estimate circuit execution time
           execution-time-us (estimate-circuit-execution-time circuit shots backend)
-          
+
           ;; Calculate detailed cost breakdown
           cost-breakdown (calculate-cost-breakdown execution-time-us shots device-pricing circuit)
-          
+
           total-cost (:total-cost cost-breakdown)]
-      
+
       {:total-cost total-cost
        :currency "USD"
        :cost-breakdown {:processor-time-cost (:processor-time-cost cost-breakdown)
-                       :shot-cost (:shot-cost cost-breakdown)
-                       :complexity-fee (:complexity-fee cost-breakdown)
-                       :priority-fee (:priority-fee cost-breakdown)}
+                        :shot-cost (:shot-cost cost-breakdown)
+                        :complexity-fee (:complexity-fee cost-breakdown)
+                        :priority-fee (:priority-fee cost-breakdown)}
        :estimated-credits (* total-cost 100) ; Assume 100 credits per USD
        :execution-estimate {:execution-time-seconds (:execution-time-seconds cost-breakdown)
-                           :execution-time-microseconds (:execution-time-microseconds cost-breakdown)
-                           :shots shots
-                           :backend backend
-                           :device-tier (:tier device-pricing)
-                           :device-description (:description device-pricing)}
+                            :execution-time-microseconds (:execution-time-microseconds cost-breakdown)
+                            :shots shots
+                            :backend backend
+                            :device-tier (:tier device-pricing)
+                            :device-description (:description device-pricing)}
        :circuit-summary {:gate-count (count (:operations circuit))
-                        :num-qubits (:num-qubits circuit)
-                        :circuit-depth (or (:depth circuit) (count (:operations circuit)))}
+                         :num-qubits (:num-qubits circuit)
+                         :circuit-depth (or (:depth circuit) (count (:operations circuit)))}
        :pricing-notes ["Costs estimated based on IBM Quantum pricing structure"
-                      "Real costs may vary based on actual execution time and queue priority"
-                      "Simulator execution is free of charge"
-                      "Hardware execution includes processor time, shot fees, and complexity charges"]}))
-
-  (batch-submit [_this circuits options]
-    (let [circs (if (sequential? circuits) circuits [circuits])
-          ids (mapv (fn [c] (qb/submit-circuit _this c options)) circs)
-          batch-id (str (java.util.UUID/randomUUID))]
-      (swap! jobs assoc batch-id {:job-ids ids :submitted-at (java.time.Instant/now)})
-      {:batch-id batch-id :job-ids ids}))
-
-  (get-batch-status [_this batch-id]
-    (if-let [b (@jobs batch-id)]
-      {:batch-id batch-id :job-ids (:job-ids b)}
-      {:error "unknown-batch" :batch-id batch-id}))
-
-  (get-batch-results [_this batch-id]
-    (if-let [b (@jobs batch-id)]
-      {:batch-id batch-id :results (mapv (fn [job-id] (qb/get-job-result _this job-id)) (:job-ids b))}
-      {:error "unknown-batch" :batch-id batch-id}))
+                       "Real costs may vary based on actual execution time and queue priority"
+                       "Simulator execution is free of charge"
+                       "Hardware execution includes processor time, shot fees, and complexity charges"]}))
 
   ;; IBM Quantum specific protocol implementation
   IBMQuantumBackend
@@ -532,15 +540,15 @@
         (let [provider-id (:provider-id entry)
               resp (call-martian ibmq api-token :get-job-metrics {:id provider-id})
               body (safe-parse-body (:body resp))
-              
+
               ;; Extract timing information
               queue-time (or (:queue_time body) (:queueTime body) 0)
               execution-time (or (:execution_time body) (:executionTime body) (:quantum_seconds body) 0)
               total-time (+ queue-time execution-time)
-              
+
               ;; Extract cost information
               cost-info (or (:cost body) (:usage body) {})]
-          
+
           {:queue-time-seconds queue-time
            :execution-time-seconds execution-time
            :total-time-seconds total-time
@@ -548,36 +556,36 @@
            :provider-id provider-id
            :raw-metrics body})
         {:error "unknown-job" :job-id job-id})))
-  
+
   (get-job-logs [_this job-id]
     (let [api-token (:api-token @state)]
       (if-let [entry (@jobs job-id)]
         (let [provider-id (:provider-id entry)
               resp (call-martian ibmq api-token :get-job-logs {:id provider-id})
               body (safe-parse-body (:body resp))
-              
+
               logs (or (:logs body) (:messages body) [])
               log-level (or (:log_level body) (:logLevel body) "INFO")]
-          
+
           {:logs logs
            :log-level log-level
            :provider-id provider-id
            :raw-logs body})
         {:error "unknown-job" :job-id job-id})))
-  
+
   (get-transpiled-circuit [_this job-id]
     (let [api-token (:api-token @state)]
       (if-let [entry (@jobs job-id)]
         (let [provider-id (:provider-id entry)
               resp (call-martian ibmq api-token :get-transpiled-circuits {:id provider-id})
               body (safe-parse-body (:body resp))
-              
+
               ;; Extract transpiled circuit information
               transpiled-qasm (or (:qasm body) (:transpiled_qasm body) (:circuit body))
               optimization-level (or (:optimization_level body) (:optimizationLevel body) 1)
               original-gates (or (:original_gate_count body) (:originalGateCount body))
               optimized-gates (or (:optimized_gate_count body) (:optimizedGateCount body))]
-          
+
           {:transpiled-qasm transpiled-qasm
            :optimization-level optimization-level
            :gate-count-original original-gates
@@ -585,87 +593,87 @@
            :provider-id provider-id
            :raw-transpiled body})
         {:error "unknown-job" :job-id job-id})))
-  
+
   (create-session [_this options]
     (let [api-token (:api-token @state)
           {:keys [backend max-time-seconds instance channel]
            :or {max-time-seconds 3600}} options ; Default 1 hour
-          
+
           body (cond-> {:backend backend}
                  max-time-seconds (assoc :max_time max-time-seconds)
                  instance (assoc :instance instance)
                  channel (assoc :channel channel))
-          
+
           resp (call-martian ibmq api-token :create-session {:body body})
           response-body (safe-parse-body (:body resp))
-          
+
           session-id (or (:id response-body) (:session_id response-body))
           status (or (:status response-body) "created")]
-      
+
       (when session-id
         ;; Store session info for tracking
-        (swap! state assoc-in [:sessions session-id] 
+        (swap! state assoc-in [:sessions session-id]
                {:backend backend
                 :created-at (java.time.Instant/now)
                 :max-time-seconds max-time-seconds}))
-      
+
       {:session-id session-id
        :backend backend
        :status (keyword status)
        :created-at (java.time.Instant/now)
        :max-time-seconds max-time-seconds
        :raw-response response-body}))
-  
+
   (close-session [_this session-id]
     (let [api-token (:api-token @state)
           resp (call-martian ibmq api-token :close-session {:id session-id})
           response-body (safe-parse-body (:body resp))
-          
+
           closed? (or (:closed response-body) (= (:status response-body) "closed") (= 200 (:status resp)))
           final-cost (or (:cost response-body) (:usage response-body))]
-      
+
       ;; Remove from tracked sessions
       (swap! state update :sessions dissoc session-id)
-      
+
       {:session-id session-id
        :closed? closed?
        :final-cost final-cost
        :raw-response response-body}))
-  
+
   (get-session-info [_this session-id]
     (let [api-token (:api-token @state)
           resp (call-martian ibmq api-token :get-session {:id session-id})
           response-body (safe-parse-body (:body resp))
-          
+
           ;; Get local tracking info
           local-info (get-in @state [:sessions session-id])]
-      
+
       (merge local-info
              {:session-id session-id
               :status (keyword (or (:status response-body) "unknown"))
               :current-cost (or (:cost response-body) (:usage response-body))
               :active-jobs (or (:active_jobs response-body) (:activeJobs response-body) 0)
               :raw-session response-body})))
-  
+
   (get-usage-analytics [_this options]
     (let [api-token (:api-token @state)
           {:keys [start-date end-date backend]} options
-          
+
           params (cond-> {}
                    start-date (assoc :start_date start-date)
-                   end-date (assoc :end_date end-date)  
+                   end-date (assoc :end_date end-date)
                    backend (assoc :backend backend))
-          
+
           resp (call-martian ibmq api-token :get-usage-analytics {:query-params params})
           body (safe-parse-body (:body resp))
-          
+
           ;; Extract analytics information
           total-cost (or (:total_cost body) (:totalCost body) 0)
           job-count (or (:job_count body) (:jobCount body) 0)
           quantum-time (or (:quantum_seconds body) (:quantumTime body) 0)
           backend-costs (or (:backend_breakdown body) (:backendBreakdown body) {})
           trends (or (:usage_trends body) (:usageTrends body) [])]
-      
+
       {:total-cost total-cost
        :job-count job-count
        :total-quantum-time quantum-time
@@ -684,6 +692,6 @@
   * api-token (string) optional initial token
   Returns backend record implementing QClojure protocols.
   "
-  ([] (create-ibm-quantum-backend nil))
-  ([api-token]
+  ([config] (create-ibm-quantum-backend nil))
+  ([config device api-token]
    (->IBMQBackend (atom {:api-token api-token}) (atom {}))))
