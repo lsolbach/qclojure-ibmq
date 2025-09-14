@@ -254,14 +254,12 @@
     
     Parameters:
     - options: Map with session configuration:
-      - :backend - Target backend device
       - :max-time-seconds - Maximum session duration (optional)
       - :instance - IBM instance (optional)
       - :channel - Channel for session (optional)
     
     Returns: Map with:
     - :session-id - IBM session identifier
-    - :backend - Target backend
     - :status - Session status
     - :created-at - Session creation timestamp")
   
@@ -319,7 +317,7 @@
 (defn- normalize-job-id [resp]
   (or (some-> resp :body :id) (some-> resp :body :job_id) (some-> resp :body)))
 
-
+;; TODO use backend-state for all state
 (defrecord IBMQBackend [state jobs]
   backend/QuantumBackend
   (backend-info [_this]
@@ -348,11 +346,20 @@
           {:keys [shots backend program-id program_id pubs tags log_level runtime cost session_id name]
            :or {shots 128 name "qclojure-job"}}
           options
+
+          device (:current-device @backend-state)
+          ;; Apply hardware optimization if requested
+          optimization-result (hwopt/optimize circuit device options)
+
+          optimized-circuit (:circuit optimization-result)
+
+          ;; Transform circuit to QASM3 format for Braket
+          qasm3-circuit (qasm3/circuit-to-qasm optimized-circuit)
+
           program-id (or program-id program_id)
           _ (when (nil? backend) (throw (ex-info "Backend required (:backend)" {:options options})))
           _ (when (nil? program-id) (throw (ex-info "Program ID required (:program-id or :program_id)" {:options options})))
-          qasm (qasm3/circuit-to-qasm circuit)
-          pubs (if (seq pubs) pubs [[qasm {} shots]])
+          pubs (if (seq pubs) pubs [[qasm3-circuit {} shots]])
           body (cond-> {:program_id program-id
                         :backend backend
                         :params {:pubs pubs :options {:default_shots shots}}
@@ -534,7 +541,7 @@
 
   ;; IBM Quantum specific protocol implementation
   IBMQuantumBackend
-  (get-job-metrics [_this job-id]
+  (job-metrics [_this job-id]
     (let [api-token (:api-token @state)]
       (if-let [entry (@jobs job-id)]
         (let [provider-id (:provider-id entry)
@@ -557,7 +564,7 @@
            :raw-metrics body})
         {:error "unknown-job" :job-id job-id})))
 
-  (get-job-logs [_this job-id]
+  (job-logs [_this job-id]
     (let [api-token (:api-token @state)]
       (if-let [entry (@jobs job-id)]
         (let [provider-id (:provider-id entry)
@@ -573,7 +580,7 @@
            :raw-logs body})
         {:error "unknown-job" :job-id job-id})))
 
-  (get-transpiled-circuit [_this job-id]
+  (transpiled-circuit [_this job-id]
     (let [api-token (:api-token @state)]
       (if-let [entry (@jobs job-id)]
         (let [provider-id (:provider-id entry)
@@ -640,6 +647,7 @@
        :final-cost final-cost
        :raw-response response-body}))
 
+  ; TODO consolidate with session-info
   (get-session-info [_this session-id]
     (let [api-token (:api-token @state)
           resp (call-martian ibmq api-token :get-session {:id session-id})
@@ -655,7 +663,7 @@
               :active-jobs (or (:active_jobs response-body) (:activeJobs response-body) 0)
               :raw-session response-body})))
 
-  (get-usage-analytics [_this options]
+  (usage-analytics [_this options]
     (let [api-token (:api-token @state)
           {:keys [start-date end-date backend]} options
 
